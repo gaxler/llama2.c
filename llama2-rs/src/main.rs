@@ -1,3 +1,4 @@
+use std::marker::PhantomData;
 use std::mem;
 use std::{
     fs::File,
@@ -91,27 +92,70 @@ impl Vocab {
 // generic placeholder
 type Ty = f32;
 
+struct Q8Blocked {
+    factors: Vec<Ty>,
+    vals: Vec<i8>,
+    block_size: usize,
+}
+
+#[derive(Debug)]
 struct Q8Vec {
     factor: Ty,
     vals: Vec<i8>,
 }
 
-impl Q8Vec {
-    fn dot(&self, other: &Self) -> Ty {
-        let common_fact = self.factor * other.factor;
-        self.vals
-            .iter()
-            .zip(other.vals.iter())
-            .map(|(x, y)| (x * y) as Ty)
-            .fold(0 as Ty, |acc, v| v * common_fact)
-    }
+#[inline]
+fn _quantize_block<'a>(block: &'a [Ty]) -> (f32, impl Iterator<Item = i8> + 'a) {
+    let rmax = block.iter().fold(Ty::NAN, |acc, &v| acc.max(v.abs()));
+    let inv_factor = i8::MAX as Ty / rmax;
+    let vals = block
+        .iter()
+        .cloned()
+        .map(move |v| (v * inv_factor).round() as i8);
+    (1 as Ty / inv_factor, vals)
+}
 
-    fn quantize(vec: &[Ty]) -> Self {
-        let rmax = vec.iter().fold(Ty::NAN, |acc, &v| acc.max(v.abs()));
-        let inv_factor = i8::MAX as Ty / rmax;
-        let vals = vec.iter().map(|v| (v * inv_factor).round() as i8);
+impl Q8Vec {
+    fn dot(&self, rhs: &Q8Vec) -> Ty {
+        let common_fact = self.factor * rhs.factor;
+        let res = self
+            .vals
+            .iter()
+            .zip(rhs.vals.iter())
+            .map(|(&x, &y)| x as i32 * y as i32)
+            .fold(0i32, |acc, v| v + acc);
+        (res as Ty) * common_fact
+    }
+}
+
+impl Q8Blocked {
+    fn quantize(data: &[Ty], block_size: usize) -> Self {
+        let mut factors = vec![];
+        let mut vals = vec![];
+        let blocks = data.chunks_exact(block_size);
+        let rem = (blocks.remainder().len() > 0).then(|| _quantize_block(blocks.remainder()));
+        for block in blocks {
+            let (factor, _vals) = _quantize_block(block);
+            factors.push(factor);
+            vals.extend(_vals);
+        }
+        if let Some((b, v)) = rem {
+            factors.push(b);
+            vals.extend(v);
+        };
         Self {
-            factor: 1 as Ty / inv_factor,
+            factors,
+            vals,
+            block_size,
+        }
+    }
+}
+
+impl Q8Vec {
+    fn quantize(vec: &[Ty]) -> Self {
+        let (factor, vals) = _quantize_block(vec);
+        Self {
+            factor,
             vals: vals.collect(),
         }
     }
@@ -166,7 +210,7 @@ struct TransformerWeights<Q> {
     /// (seq_len, dim/2)
     freq_cis_imag: Vec<Ty>,
     /// Last layer classifier: (vocab_size, dim)
-    wcls: Option<Vec<Ty>>,
+    wcls: Option<Vec<Q>>,
 }
 
 fn _alloc_and_read(file: &mut File, size: usize) -> Vec<Ty> {
@@ -236,6 +280,12 @@ impl TransformerWeights<Ty> {
 impl TransformerWeights<Q8Vec> {
     fn read_from_file(cfg: &Config, path: &str) -> Self {
         let (vecs, wcls) = Self::_alloc_vecs(cfg, path);
+        let wcls = wcls.map(|v| {
+            v.chunks_exact(cfg.dim)
+                .map(|v| Q8Vec::quantize(v))
+                .collect::<Vec<_>>()
+        });
+
         Self {
             token_embedding_table: vecs[0].to_owned(),
             rms_att_weight: vecs[1].to_owned(),
@@ -255,7 +305,7 @@ impl TransformerWeights<Q8Vec> {
     }
 }
 
-struct RunState {
+struct RunState<Q> {
     /// activation at current time stamp (dim,)
     x: Vec<Ty>,
     /// same, but inside a residual branch (dim,)
@@ -281,6 +331,8 @@ struct RunState {
     key_cache: Vec<Ty>,
     /// (layer, seq_len, dim)
     value_cache: Vec<Ty>,
+    weights: TransformerWeights<Q>
+
 }
 
 fn rmsnorm(out: &mut [Ty], x: &[Ty], w: &[Ty]) {
@@ -311,11 +363,10 @@ fn matmul(out: &mut [Ty], x: &[Ty], w: &[Ty], in_dim: usize) {
 #[cfg(not(feature = "parallel"))]
 fn matmul(out: &mut [Ty], x: &[Ty], w: &[Ty], in_dim: usize) {
     for (row, out_elem) in w.chunks_exact(in_dim).zip(out.iter_mut()) {
-        let val = row
+        *out_elem = row
             .iter()
             .zip(x.iter())
             .fold(0 as Ty, |acc, (&_w, &_x)| acc + _w * _x);
-        *out_elem = val;
     }
 }
 
@@ -414,8 +465,8 @@ fn _att_head_impl(
     }
 }
 
-impl RunState {
-    fn init(cfg: &Config) -> Self {
+impl<Q> RunState<Q> {
+    fn init(cfg: &Config, w: TransformerWeights<Q>) -> Self {
         let f = |size: usize| vec![0 as Ty; size];
         Self {
             x: f(cfg.dim),
@@ -430,17 +481,35 @@ impl RunState {
             logits: f(cfg.vocab_size),
             key_cache: f(cfg.n_layers * cfg.seq_len * cfg.dim),
             value_cache: f(cfg.n_layers * cfg.seq_len * cfg.dim),
+            weights: w
         }
     }
 
-    fn qkv_for_layer(&mut self, l: usize, w: &TransformerWeights<Ty>, dim: usize) {
-        let wq = _uncheked_slice(&w.wq, l * dim * dim, dim * dim);
-        let wk = _uncheked_slice(&w.wk, l * dim * dim, dim * dim);
-        let wv = _uncheked_slice(&w.wv, l * dim * dim, dim * dim);
+    fn qkv_for_layer(&mut self, l: usize, dim: usize) {
+        let w = &self.weights;
 
-        matmul(&mut self.q, &self.xb, wq, dim);
-        matmul(&mut self.k, &self.xb, wk, dim);
-        matmul(&mut self.v, &self.xb, wv, dim);
+        #[cfg(feature = "quant")]
+        {
+            let wq = _uncheked_slice(&w.wq, l * dim, dim);
+            let wk = _uncheked_slice(&w.wk, l * dim, dim);
+            let wv = _uncheked_slice(&w.wv, l * dim, dim);
+
+            let qxb = Q8Vec::quantize(&self.xb);
+            matmul_q8_ty(&mut self.q, &qxb, wq);
+            matmul_q8_ty(&mut self.k, &qxb, wk);
+            matmul_q8_ty(&mut self.v, &qxb, wv);
+        }
+
+        #[cfg(not(feature = "quant"))]
+        {
+            let wq = _uncheked_slice(&w.wq, l * dim * dim, dim * dim);
+            let wk = _uncheked_slice(&w.wk, l * dim * dim, dim * dim);
+            let wv = _uncheked_slice(&w.wv, l * dim * dim, dim * dim);
+
+            matmul(&mut self.q, &self.xb, wq, dim);
+            matmul(&mut self.k, &self.xb, wk, dim);
+            matmul(&mut self.v, &self.xb, wv, dim);
+        }
     }
 
     fn cache_kv(&mut self, pos: usize, layer: usize, cfg: &Config) {
@@ -452,7 +521,8 @@ impl RunState {
         vc.copy_from_slice(&self.v);
     }
 
-    fn rope(&mut self, pos: usize, w: &TransformerWeights<Ty>, n_heads: usize, dim: usize) {
+    fn rope(&mut self, pos: usize, n_heads: usize, dim: usize) {
+        let w = &self.weights;
         let head_size = dim / n_heads;
         let qk_heads = self
             .q
@@ -529,7 +599,8 @@ impl RunState {
         (0..cfg.n_heads).for_each(attn_lambda);
     }
 
-    fn ffn(&mut self, l: usize, w: &TransformerWeights<Ty>, cfg: &Config) {
+    fn ffn(&mut self, l: usize, cfg: &Config) {
+        let w = &self.weights;
         let rms_ffn_w = _uncheked_slice(&w.rms_ffn_weight, l * cfg.dim, cfg.dim);
         // normalize after adding residual
         rmsnorm(&mut self.xb, &self.x, rms_ffn_w);
@@ -565,7 +636,8 @@ impl RunState {
         matmul(&mut self.xb, &self.hb, w2, cfg.hidden_dim);
     }
 
-    fn step(&mut self, token: usize, pos: usize, w: &TransformerWeights<Ty>, cfg: &Config) {
+    fn step(&mut self, token: usize, pos: usize, cfg: &Config) {
+        let w = &self.weights;
         // copy content row
         // TODO: mayne direct indexing w/o bound checks is faster? benchmark
         w.token_embedding_table
@@ -578,9 +650,9 @@ impl RunState {
             let rms_attn_w = _uncheked_slice(&w.rms_att_weight, l * cfg.dim, cfg.dim);
             rmsnorm(&mut self.xb, &self.x, rms_attn_w);
 
-            self.qkv_for_layer(l, w, cfg.dim);
+            self.qkv_for_layer(l,  cfg.dim);
 
-            self.rope(pos, w, cfg.n_heads, cfg.dim);
+            self.rope(pos,  cfg.n_heads, cfg.dim);
             self.cache_kv(pos, l, cfg);
             self.attention(pos, l, cfg);
             // self.aggregate_attention(l, pos, C);
@@ -593,7 +665,7 @@ impl RunState {
                 .zip(self.xb2.iter())
                 .for_each(|(dst, src)| *dst += *src);
 
-            self.ffn(l, w, cfg);
+            self.ffn(l,  cfg);
             // post ffn residual
             self.x
                 .iter_mut()
@@ -648,7 +720,13 @@ fn main() {
 
     let vocab = Vocab::from_file(config.vocab_size, tokenizer_path);
     let st = Instant::now();
+
+    #[cfg(feature = "quant")]
+    let weights = TransformerWeights::<Q8Vec>::read_from_file(&config, &model_path);
+
+    #[cfg(not(feature = "quant"))]
     let weights = TransformerWeights::<Ty>::read_from_file(&config, &model_path);
+
     println!(
         "--> [Loaded weights in {} secs]\n\n",
         st.elapsed().as_secs()
@@ -693,4 +771,44 @@ fn main() {
     let ts = ts / (benches.len() as f32);
 
     println!("\n{:.3} Tokens/Sec", ts);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn q8_matmul_sanity_check() {
+        let model_path = "../stories15M.bin";
+        let config = Config::from_file(model_path);
+        let block_size = 2f32.powf(((config.dim as f32).log(2f32)).ceil()) as usize;
+        dbg!(block_size);
+
+        let qw = TransformerWeights::<Q8Vec>::read_from_file(&config, &model_path);
+        println!("Size of quant: {}", std::mem::size_of_val(&*qw.wo));
+        let w = TransformerWeights::<Ty>::read_from_file(&config, &model_path);
+        println!("Size of float: {}", std::mem::size_of_val(&*w.wo));
+
+        let mut res = vec![0f32; config.dim];
+        let st = std::time::Instant::now();
+        (0..100).for_each(|i| {
+            let x = &qw.token_embedding_table[i * config.dim..(i + 1) * config.dim];
+            matmul(&mut res, x, &w.wo, config.dim)
+        });
+        println!("Took {:3}ms", st.elapsed().as_millis());
+
+        let mut qres = vec![0f32; config.dim];
+
+        let st = std::time::Instant::now();
+        (0..100).for_each(|i| {
+            let qx =
+                Q8Vec::quantize(&qw.token_embedding_table[i * config.dim..(i + 1) * config.dim]);
+            matmul_q8_ty(&mut qres, &qx, &qw.wo)
+        });
+        println!("Quantized matmuls took {:3}ms", st.elapsed().as_millis());
+
+        for (r, qr) in res.iter().zip(qres.iter()).take(5) {
+            println!("{:3}", r / qr);
+        }
+    }
 }
