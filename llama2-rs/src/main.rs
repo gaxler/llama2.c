@@ -14,6 +14,15 @@ use rayon::prelude::*;
 const CONF_VALS: usize = 7;
 const CONF_SIZE: usize = std::mem::size_of::<[i32; CONF_VALS]>();
 
+pub trait LlamaState {
+    type Weight;
+
+    fn rms_norm(&mut self, w: &Self::Weight, layer: usize);
+    fn self_rms_norm(&mut self, w: &Self::Weight);
+    fn add_x_xb(&mut self);
+    fn add_x_xb2(&mut self);
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Config {
     dim: usize,
@@ -283,6 +292,50 @@ struct RunState {
     value_cache: Vec<Ty>,
 }
 
+impl LlamaState for RunState {
+    type Weight = Vec<Ty>;
+
+    fn rms_norm(&mut self, w: &Self::Weight, layer: usize) {
+        let dim = self.x.len();
+        let w_it = w
+            .chunks_exact(dim)
+            .skip(layer)
+            .next()
+            .expect("Weight should be exact multiple of layers and dim");
+        let ss = self.x.iter().fold(0f32, |init, &v| init + v * v) / (self.x.len() as Ty);
+        let ss = (1 as Ty) / (ss + 1e-5).sqrt();
+        let normed = self.x.iter().zip(w_it).map(|(xx, ww)| xx * ww * ss);
+        self.xb
+            .iter_mut()
+            .zip(normed)
+            .for_each(|(dst, src)| *dst = src);
+    }
+
+    fn self_rms_norm(&mut self, w: &Self::Weight) {
+        let ss = self.x.iter().fold(0f32, |init, &v| init + v * v) / (self.x.len() as Ty);
+        let ss = (1 as Ty) / (ss + 1e-5).sqrt();
+        self.x
+            .iter_mut()
+            .zip(w.iter())
+            .for_each(|(xx, ww)| (*xx) *= ww * ss);
+    }
+    #[inline]
+    fn add_x_xb2(&mut self) {
+        self.x
+            .iter_mut()
+            .zip(self.xb2.iter())
+            .for_each(|(dst, src)| *dst += *src);
+    }
+
+    #[inline]
+    fn add_x_xb(&mut self) {
+        self.x
+            .iter_mut()
+            .zip(self.xb.iter())
+            .for_each(|(dst, src)| *dst += *src);
+    }
+}
+
 fn rmsnorm(out: &mut [Ty], x: &[Ty], w: &[Ty]) {
     let ss = x.iter().fold(0f32, |init, &v| init + v * v) / (x.len() as Ty);
     let ss = (1 as Ty) / (ss + 1e-5).sqrt();
@@ -530,9 +583,10 @@ impl RunState {
     }
 
     fn ffn(&mut self, l: usize, w: &TransformerWeights<Ty>, cfg: &Config) {
-        let rms_ffn_w = _uncheked_slice(&w.rms_ffn_weight, l * cfg.dim, cfg.dim);
+        // let rms_ffn_w = _uncheked_slice(&w.rms_ffn_weight, l * cfg.dim, cfg.dim);
         // normalize after adding residual
-        rmsnorm(&mut self.xb, &self.x, rms_ffn_w);
+        self.rms_norm(&w.rms_ffn_weight, l);
+        // rmsnorm(&mut self.xb, &self.x, rms_ffn_w);
 
         let w1 = _uncheked_slice(
             &w.w1,
@@ -575,8 +629,9 @@ impl RunState {
             .for_each(|src| self.x.as_mut_slice().copy_from_slice(src));
 
         for l in 0..cfg.n_layers {
-            let rms_attn_w = _uncheked_slice(&w.rms_att_weight, l * cfg.dim, cfg.dim);
-            rmsnorm(&mut self.xb, &self.x, rms_attn_w);
+            // let rms_attn_w = _uncheked_slice(&w.rms_att_weight, l * cfg.dim, cfg.dim);
+            self.rms_norm(&w.rms_att_weight, l);
+            // rmsnorm(&mut self.xb, &self.x, rms_attn_w);
 
             self.qkv_for_layer(l, w, cfg.dim);
 
@@ -588,26 +643,19 @@ impl RunState {
             let wo = _uncheked_slice(&w.wo, l * cfg.dim * cfg.dim, cfg.dim * cfg.dim);
             matmul(&mut self.xb2, &self.xb, wo, cfg.dim);
             // post attention residual
-            self.x
-                .iter_mut()
-                .zip(self.xb2.iter())
-                .for_each(|(dst, src)| *dst += *src);
+            self.add_x_xb2();
+            // self.x
+            //     .iter_mut()
+            //     .zip(self.xb2.iter())
+            //     .for_each(|(dst, src)| *dst += *src);
 
             self.ffn(l, w, cfg);
             // post ffn residual
-            self.x
-                .iter_mut()
-                .zip(self.xb.iter())
-                .for_each(|(dst, src)| *dst += src);
+            self.add_x_xb();
         }
 
         // last rmsnorm
-        let ss = self.x.iter().fold(0f32, |init, &v| init + v * v) / (self.x.len() as Ty);
-        let ss = (1 as Ty) / (ss + 1e-5).sqrt();
-        self.x
-            .iter_mut()
-            .zip(w.rms_final_weight.iter())
-            .for_each(|(xx, ww)| (*xx) *= ww * ss);
+        self.self_rms_norm(&w.rms_final_weight);
 
         if let Some(wcls) = &w.wcls {
             matmul(&mut self.logits, &self.x, wcls, cfg.dim);
