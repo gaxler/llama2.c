@@ -1,5 +1,3 @@
-// mod load;
-
 use std::mem;
 use std::{
     fs::File,
@@ -15,6 +13,18 @@ use rayon::prelude::*;
 
 const CONF_VALS: usize = 7;
 const CONF_SIZE: usize = std::mem::size_of::<[i32; CONF_VALS]>();
+
+#[derive(Debug, Clone, Copy)]
+pub struct Config {
+    dim: usize,
+    hidden_dim: usize,
+    n_layers: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    vocab_size: usize,
+    seq_len: usize,
+    shared_weights: bool,
+}
 
 /// Exexute LLama step
 pub trait LamaExecuter<Buffer> {
@@ -72,7 +82,6 @@ struct LlamaWeights<Layer, Rms, Emb, Buf> {
 }
 
 struct LayerWeights<Lin, Rms, Buf> {
-    layer: usize,
     rms_attn: Rms,
     rms_ffn: Rms,
     wq: Lin,
@@ -93,19 +102,25 @@ type CPULayerFloat = LayerWeights<Vec<Ty>, Vec<Ty>, Vec<Ty>>;
 type Llama2CPUFloat = LlamaWeights<CPULayerFloat, Vec<Ty>, Vec<Ty>, Vec<Ty>>;
 
 pub struct ExecutionState<Buffer> {
-    x: Buffer,   // x, xb, xb2 | (dim,)
-    xb: Buffer,  // x, xb, xb2 | (dim,)
-    xb2: Buffer, // x, xb, xb2 | (dim,)
-    /// hb, hb2 (hidden_dim,)
+    /// Shape:(dim,)
+    x: Buffer,   
+    /// Shape:(dim,)
+    xb: Buffer, 
+    /// Shape:(dim,)
+    xb2: Buffer,
+    /// Shape:(hidden_dim,)
     h1: Buffer,
+    /// Shape:(hidden_dim,)
     h2: Buffer,
-    /// (dim,): Q,K,V buffers
+    /// (dim,): Q, buffers
     q: Buffer,
+    /// (dim,): K buffer
     k: Buffer,
+    /// (dim,): V buffer 
     v: Buffer,
     /// (n_heads, seq_len): Attention Weight Buffer
     att: Buffer,
-    /// (vocab_size, )
+    /// Logits: (vocab_size, )
     logits: Buffer,
 }
 
@@ -421,7 +436,6 @@ impl Llama2CPUFloat {
 
         let layers = (0..cfg.n_layers)
             .map(|l| LayerWeights::<Vec<Ty>, Vec<Ty>, Vec<Ty>> {
-                layer: l,
                 rms_attn: w_layer_iters[0].next().unwrap(),
                 wq: w_layer_iters[1].next().unwrap(),
                 wk: w_layer_iters[2].next().unwrap(),
@@ -451,17 +465,7 @@ impl Llama2CPUFloat {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct Config {
-    dim: usize,
-    hidden_dim: usize,
-    n_layers: usize,
-    n_heads: usize,
-    n_kv_heads: usize,
-    vocab_size: usize,
-    seq_len: usize,
-    shared_weights: bool,
-}
+
 
 impl Config {
     /// Read raw bytes and force those to be our config type (which conforms to C mem layout)
@@ -622,7 +626,6 @@ fn main() {
     let vocab = Vocab::from_file(config.vocab_size, tokenizer_path);
     let st = Instant::now();
     let mut weights = LlamaWeights::load_weights(&config, &model_path);
-    // let weights = StructureWeights::from_weights(&config, weights);
     println!(
         "--> [Loaded weights in {} secs]\n\n",
         st.elapsed().as_secs()
@@ -631,7 +634,6 @@ fn main() {
     let mut benches = vec![];
     for _ in 0..1 {
         let mut state = ExecutionState::<Vec<Ty>>::init(&config);
-        //     let mut state = RunState::init(&config);
         let mut probs = vec![0 as Ty; config.vocab_size];
 
         let st = Instant::now();
