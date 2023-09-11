@@ -1,5 +1,3 @@
-// mod load;
-
 use std::mem;
 use std::{
     fs::File,
